@@ -55,8 +55,7 @@ parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 parser.add_argument('--batch-size', type=int, default=50,
                     help='Batch size to use')
 parser.add_argument('--num-workers', type=int,
-                    help=('Number of processes to use for data loading. '
-                          'Defaults to `min(8, num_cpus)`'))
+                    help=('Number of processes to use for data loading. Defaults to `min(8, num_cpus)`'))
 parser.add_argument('--device', type=str, default=None,
                     help='Device to use. Like cuda, cuda:0 or cpu')
 parser.add_argument('--dims', type=int, default=2048,
@@ -66,6 +65,7 @@ parser.add_argument('--dims', type=int, default=2048,
 parser.add_argument('path', type=str, nargs=2,
                     help=('Paths to the generated images or '
                           'to .npz statistic files'))
+parser.add_argument("--save_loc", type=str, help="save location of the results. Expects a csv file")
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
@@ -88,7 +88,7 @@ class ImagePathDataset(torch.utils.data.Dataset):
 
 
 def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
-                    num_workers=1):
+                    num_workers=1, resize=False):
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
@@ -115,7 +115,10 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
                'Setting batch size to data size'))
         batch_size = len(files)
 
-    dataset = ImagePathDataset(files, transforms=TF.ToTensor())
+    if resize:
+        dataset = ImagePathDataset(files, transforms=TF.Compose([TF.Resize(386), TF.CenterCrop(256), TF.ToTensor()]))
+    else:
+        dataset = ImagePathDataset(files, transforms=TF.Compose([TF.CenterCrop(256), TF.ToTensor()]))
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=False,
@@ -204,7 +207,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
 
 def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
-                                    device='cpu', num_workers=1):
+                                    device='cpu', num_workers=1, resize=False):
     """Calculation of the statistics used by the FID.
     Params:
     -- files       : List of image files paths
@@ -222,7 +225,7 @@ def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the inception model.
     """
-    act = get_activations(files, model, batch_size, dims, device, num_workers)
+    act = get_activations(files, model, batch_size, dims, device, num_workers, resize)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
@@ -233,12 +236,18 @@ def compute_statistics_of_path(path, model, batch_size, dims, device,
     if path.endswith('.npz'):
         with np.load(path) as f:
             m, s = f['mu'][:], f['sigma'][:]
+    elif "OCT2017" in path:
+        path = pathlib.Path(path)
+        files = sorted([file for ext in IMAGE_EXTENSIONS
+                       for file in path.glob('**/*.{}'.format(ext))])
+        m, s = calculate_activation_statistics(files, model, batch_size,
+                                               dims, device, num_workers, True)
     else:
         path = pathlib.Path(path)
         files = sorted([file for ext in IMAGE_EXTENSIONS
                        for file in path.glob('*.{}'.format(ext))])
         m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, device, num_workers)
+                                               dims, device, num_workers, False)
 
     return m, s
 
@@ -281,6 +290,11 @@ def main():
                                           device,
                                           args.dims,
                                           num_workers)
+
+    if args.save_loc is not None:
+        with open(args.save_loc, "a") as f:
+            f.write(f"{args.path[1]},{fid_value}\n")
+
     print('FID: ', fid_value)
 
 
