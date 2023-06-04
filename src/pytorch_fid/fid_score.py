@@ -34,10 +34,12 @@ limitations under the License.
 import os
 import pathlib
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from typing import Any
 
 import numpy as np
 import torch
 import torchvision.transforms as TF
+import albumentations
 from PIL import Image
 from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
@@ -69,10 +71,52 @@ parser.add_argument('path', type=str, nargs=2,
                     help=('Paths to the generated images or '
                           'to .npz statistic files'))
 parser.add_argument("--save_loc", type=str, help="save location of the results. Expects a csv file")
+parser.add_argument(
+    "--add_noise",
+    type=bool,
+    default=False,
+    const=True,
+    nargs="?",
+    help="Add noise on the target images",
+)
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
 
+class resize_with_smallest_max_size():
+    def __init__(self, max_size):
+        self.max_size = max_size
+
+    def __call__(self, image) -> Any:
+        width, height = image.size
+        aspect_ratio = width / height
+
+        if width > height:
+            new_width = self.max_size
+            new_height = int(self.max_size / aspect_ratio)
+        else:
+            new_height = self.max_size
+            new_width = int(self.max_size * aspect_ratio)
+
+        resize_transform = TF.Resize((new_height, new_width))
+        resized_image = resize_transform(image)
+
+        return resized_image
+    
+def gauss_noise_tensor(img):
+    assert isinstance(img, torch.Tensor)
+    dtype = img.dtype
+    if not img.is_floating_point():
+        img = img.to(torch.float32)
+    
+    sigma = 25.0
+    
+    out = img + sigma * torch.randn_like(img)
+    
+    if out.dtype != dtype:
+        out = out.to(dtype)
+        
+    return out
 
 class ImagePathDataset(torch.utils.data.Dataset):
     def __init__(self, files, transforms=None):
@@ -91,7 +135,7 @@ class ImagePathDataset(torch.utils.data.Dataset):
 
 
 def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
-                    num_workers=1, resize=False):
+                    num_workers=1, resize=False, add_noise=False):
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
@@ -118,10 +162,25 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
                'Setting batch size to data size'))
         batch_size = len(files)
 
+    transform_list = [
+        TF.CenterCrop(256), 
+        TF.ToTensor(),
+    ]
+
+    if add_noise:
+        transform_list.append(gauss_noise_tensor)
+
     if resize:
-        dataset = ImagePathDataset(files, transforms=TF.Compose([TF.Resize(386), TF.CenterCrop(256), TF.ToTensor()]))
+        dataset = ImagePathDataset(files, transforms=TF.Compose([
+            resize_with_smallest_max_size(max_size=384), 
+            *transform_list,
+        ]))
+        # dataset = ImagePathDataset(files, transforms=albumentations.Compose([
+        #     albumentations.SmallestMaxSize(max_size=384), 
+        #     albumentations.CenterCrop(height=256, width=256)
+        #     ]))
     else:
-        dataset = ImagePathDataset(files, transforms=TF.Compose([TF.CenterCrop(256), TF.ToTensor()]))
+        dataset = ImagePathDataset(files, transforms=TF.Compose(transform_list))
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=False,
@@ -209,8 +268,8 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
             + np.trace(sigma2) - 2 * tr_covmean)
 
 
-def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
-                                    device='cpu', num_workers=1, resize=False):
+def calculate_activation_statistics(files, model, batch_size=50, dims=2048, device='cpu',
+                                    num_workers=1, resize=False, add_noise=False):
     """Calculation of the statistics used by the FID.
     Params:
     -- files       : List of image files paths
@@ -228,14 +287,14 @@ def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the inception model.
     """
-    act = get_activations(files, model, batch_size, dims, device, num_workers, resize)
+    act = get_activations(files, model, batch_size, dims, device, num_workers, resize, add_noise)
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
     return mu, sigma
 
 
 def compute_statistics_of_path(path, model, batch_size, dims, device,
-                               num_workers=1):
+                               num_workers=1, add_noise=False):
     if path.endswith('.npz'):
         with np.load(path) as f:
             m, s = f['mu'][:], f['sigma'][:]
@@ -244,18 +303,18 @@ def compute_statistics_of_path(path, model, batch_size, dims, device,
         files = sorted([file for ext in IMAGE_EXTENSIONS
                        for file in path.glob('**/*.{}'.format(ext))])
         m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, device, num_workers, True)
+                                               dims, device, num_workers, True, add_noise)
     else:
         path = pathlib.Path(path)
         files = sorted([file for ext in IMAGE_EXTENSIONS
                        for file in path.glob('*.{}'.format(ext))])
         m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, device, num_workers, False)
+                                               dims, device, num_workers, False, add_noise)
 
     return m, s
 
 
-def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=1):
+def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=1, add_noise=False):
     """Calculates the FID of two paths"""
     for p in paths:
         if not os.path.exists(p):
@@ -266,9 +325,9 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=1):
     model = InceptionV3([block_idx]).to(device)
 
     m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
-                                        dims, device, num_workers)
+                                        dims, device, num_workers, False)
     m2, s2 = compute_statistics_of_path(paths[1], model, batch_size,
-                                        dims, device, num_workers)
+                                        dims, device, num_workers, add_noise)
     fid_value = calculate_frechet_distance(m1, s1, m2, s2)
 
     return fid_value
@@ -323,7 +382,8 @@ def main():
                                           args.batch_size,
                                           device,
                                           args.dims,
-                                          num_workers)
+                                          num_workers,
+                                          args.add_noise)
 
     if args.save_loc is not None:
         with open(args.save_loc, "a") as f:
